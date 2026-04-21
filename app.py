@@ -10,6 +10,13 @@ import os
 
 app = Flask(__name__)
 
+@app.after_request
+def add_cors(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+    return response
+
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3-flash-preview")
 VALID_API_KEY = os.environ.get("PROXY_API_KEY", "changeme")
@@ -105,8 +112,10 @@ def gemini_response_to_openai(gemini_response, model_name):
         }
 
 
-@app.route("/v1/chat/completions", methods=["POST"])
+@app.route("/v1/chat/completions", methods=["POST", "OPTIONS"])
 def chat_completions():
+    if request.method == "OPTIONS":
+        return jsonify({"status": "ok"}), 200
     # Validate API key
     auth = request.headers.get("Authorization", "")
     if auth.replace("Bearer ", "") != VALID_API_KEY:
