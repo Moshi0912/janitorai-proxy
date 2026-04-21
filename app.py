@@ -192,8 +192,11 @@ def list_models():
 
 
 @app.route("/", methods=["GET"])
+@app.route("/v1", methods=["GET", "OPTIONS"])
 def health():
-    return jsonify({"status": "ok", "service": "janitorai-proxy", "model": GEMINI_MODEL})
+    if request.method == "OPTIONS":
+        return jsonify({"status": "ok"}), 200
+    return jsonify({"status": "ok", "service": "janitorai-proxy", "model": GEMINI_MODEL, "object": "list"})
 
 
 if __name__ == "__main__":
