@@ -4,9 +4,11 @@ Forwards requests to Google Gemini API in OpenAI-compatible format.
 Deploy on Render free tier.
 """
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 import requests
 import os
+import json
+import uuid
 
 app = Flask(__name__)
 
@@ -21,7 +23,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3-flash-preview")
 VALID_API_KEY = os.environ.get("PROXY_API_KEY", "changeme")
 
-# Gemini to OpenAI message mapping
+
 def convert_messages_to_gemini(messages):
     """Convert OpenAI-style messages to Gemini contents format."""
     contents = []
@@ -35,7 +37,6 @@ def convert_messages_to_gemini(messages):
             system_instruction = {"parts": [{"text": content}]}
             continue
         
-        # Gemini uses "user" and "model" roles
         gemini_role = "user" if role in ("user", "system") else "model"
         
         if isinstance(content, str):
@@ -48,7 +49,6 @@ def convert_messages_to_gemini(messages):
                 elif part.get("type") == "image_url":
                     url = part["image_url"]["url"]
                     if url.startswith("data:"):
-                        # Base64 image
                         import base64
                         header, data = url.split(",", 1)
                         mime = header.split(":")[1].split(";")[0]
@@ -60,63 +60,63 @@ def convert_messages_to_gemini(messages):
     return contents, system_instruction
 
 
-def gemini_response_to_openai(gemini_response, model_name):
-    """Convert Gemini API response to OpenAI format."""
-    try:
-        candidates = gemini_response.get("candidates", [])
-        if not candidates:
-            return {
-                "id": "chatcmpl-" + gemini_response.get("responseId", "unknown"),
-                "object": "chat.completion",
-                "model": model_name,
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": ""},
-                    "finish_reason": "stop"
-                }],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-            }
-        
-        candidate = candidates[0]
-        content_parts = candidate.get("content", {}).get("parts", [])
-        text = "".join([p.get("text", "") for p in content_parts])
-        
-        usage = gemini_response.get("usageMetadata", {})
-        
+def make_openai_response(gemini_data, model_name):
+    """Convert Gemini response to OpenAI format."""
+    cid = "chatcmpl-" + str(uuid.uuid4())[:12]
+    candidates = gemini_data.get("candidates", [])
+    
+    if not candidates:
         return {
-            "id": "chatcmpl-" + gemini_response.get("responseId", "unknown"),
-            "object": "chat.completion",
-            "model": model_name,
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": text},
-                "finish_reason": "stop"
-            }],
-            "usage": {
-                "prompt_tokens": usage.get("promptTokenCount", 0),
-                "completion_tokens": usage.get("candidatesTokenCount", 0),
-                "total_tokens": usage.get("totalTokenCount", 0)
-            }
-        }
-    except Exception as e:
-        return {
-            "id": "chatcmpl-error",
-            "object": "chat.completion",
-            "model": model_name,
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": f"Error parsing response: {str(e)}"},
-                "finish_reason": "error"
-            }],
+            "id": cid, "object": "chat.completion", "model": model_name,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": ""}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
         }
+    
+    candidate = candidates[0]
+    content_parts = candidate.get("content", {}).get("parts", [])
+    text = "".join([p.get("text", "") for p in content_parts])
+    usage = gemini_data.get("usageMetadata", {})
+    
+    return {
+        "id": cid, "object": "chat.completion", "model": model_name,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+        "usage": {
+            "prompt_tokens": usage.get("promptTokenCount", 0),
+            "completion_tokens": usage.get("candidatesTokenCount", 0),
+            "total_tokens": usage.get("totalTokenCount", 0)
+        }
+    }
+
+
+def make_stream_chunks(text, model_name):
+    """Generate SSE stream chunks for OpenAI compatibility."""
+    cid = "chatcmpl-" + str(uuid.uuid4())[:12]
+    words = text.split()
+    
+    for i, word in enumerate(words):
+        delta = {"content": word + (" " if i < len(words) - 1 else "")}
+        if i == 0:
+            delta["role"] = "assistant"
+        chunk = {
+            "id": cid, "object": "chat.completion.chunk", "model": model_name,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": None}]
+        }
+        yield f"data: {json.dumps(chunk)}\n\n"
+    
+    # Final chunk with finish_reason
+    final = {
+        "id": cid, "object": "chat.completion.chunk", "model": model_name,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+    }
+    yield f"data: {json.dumps(final)}\n\n"
+    yield "data: [DONE]\n\n"
 
 
 @app.route("/v1/chat/completions", methods=["POST", "OPTIONS"])
 def chat_completions():
     if request.method == "OPTIONS":
         return jsonify({"status": "ok"}), 200
-    # Validate API key
+    
     auth = request.headers.get("Authorization", "")
     if auth.replace("Bearer ", "") != VALID_API_KEY:
         return jsonify({"error": {"message": "Invalid API key", "type": "auth_error"}}), 401
@@ -129,14 +129,10 @@ def chat_completions():
     temperature = data.get("temperature", 0.7)
     max_tokens = data.get("max_tokens", 4096)
     stream = data.get("stream", False)
-    
-    # Use model from request or default
     requested_model = data.get("model", GEMINI_MODEL)
     
-    # Convert messages to Gemini format
     contents, system_instruction = convert_messages_to_gemini(messages)
     
-    # Build Gemini request
     gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
     
     gemini_payload = {
@@ -162,8 +158,12 @@ def chat_completions():
                 }
             }), resp.status_code
         
-        openai_response = gemini_response_to_openai(gemini_data, requested_model)
-        return jsonify(openai_response)
+        if stream:
+            openai_resp = make_openai_response(gemini_data, requested_model)
+            text = openai_resp["choices"][0]["message"]["content"]
+            return Response(make_stream_chunks(text, requested_model), mimetype="text/event-stream")
+        else:
+            return jsonify(make_openai_response(gemini_data, requested_model))
     
     except requests.exceptions.Timeout:
         return jsonify({"error": {"message": "Request timed out", "type": "timeout"}}), 504
@@ -171,8 +171,11 @@ def chat_completions():
         return jsonify({"error": {"message": str(e), "type": "server_error"}}), 500
 
 
-@app.route("/v1/models", methods=["GET"])
+@app.route("/v1/models", methods=["GET", "OPTIONS"])
 def list_models():
+    if request.method == "OPTIONS":
+        return jsonify({"status": "ok"}), 200
+    
     auth = request.headers.get("Authorization", "")
     if auth.replace("Bearer ", "") != VALID_API_KEY:
         return jsonify({"error": {"message": "Invalid API key", "type": "auth_error"}}), 401
@@ -180,10 +183,10 @@ def list_models():
     return jsonify({
         "object": "list",
         "data": [
-            {"id": GEMINI_MODEL, "object": "model"},
-            {"id": "gemini-2.0-flash", "object": "model"},
-            {"id": "gemini-2.5-flash", "object": "model"},
-            {"id": "gemini-2.5-pro", "object": "model"},
+            {"id": GEMINI_MODEL, "object": "model", "owned_by": "google"},
+            {"id": "gemini-2.0-flash", "object": "model", "owned_by": "google"},
+            {"id": "gemini-2.5-flash", "object": "model", "owned_by": "google"},
+            {"id": "gemini-2.5-pro", "object": "model", "owned_by": "google"},
         ]
     })
 
